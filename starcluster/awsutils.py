@@ -253,7 +253,8 @@ class EasyEC2(EasyAWS):
         if auth_group_traffic:
             src_group = self.get_group_or_none(name)
             sg.authorize('icmp', -1, -1, src_group=src_group)
-            sg.authorize('tcp', 1, 65535, src_group=src_group)
+            #sg.authorize('tcp', 1, 65535, src_group=src_group)
+            sg.authorize('tcp', 1, 65535,static.WORLD_CIDRIP)
             sg.authorize('udp', 1, 65535, src_group=src_group)
         return sg
 
@@ -308,7 +309,17 @@ class EasyEC2(EasyAWS):
         """
         Returns all security groups on this EC2 account
         """
-        return self.conn.get_all_security_groups(filters=filters)
+        #return self.conn.get_all_security_groups(filters=filters)
+        groups = self.conn.get_all_security_groups(filters=filters)
+        if filters == None or len(filters)==0:
+            return groups
+        results=[]
+        for f in filters:
+            
+            for g in groups:
+                if f == 'group-name' and( filters[f].count( g.name)>0 or filters[f]=='_sc-*'):
+                    results.append(g)
+        return results
 
     def get_permission_or_none(self, group, ip_protocol, from_port, to_port,
                                cidr_ip=None):
@@ -411,19 +422,20 @@ class EasyEC2(EasyAWS):
         """
         Convenience method for running spot or flat-rate instances
         """
-        if not block_device_map:
+        if block_device_map:
             img = self.get_image(image_id)
             bdmap = self.create_block_device_map(add_ephemeral_drives=True,
                                                  num_ephemeral_drives=24)
             # Prune drives from runtime block device map that may override EBS
             # volumes specified in the AMIs block device map
-            for dev in img.block_device_mapping:
-                bdt = img.block_device_mapping.get(dev)
-                if not bdt.ephemeral_name and dev in bdmap:
-                    log.debug("EBS volume already mapped to %s by AMI" % dev)
-                    log.debug("Removing %s from runtime block device map" %
+            if not img.block_device_mapping:
+                for dev in img.block_device_mapping:
+                    bdt = img.block_device_mapping.get(dev)
+                    if not bdt.ephemeral_name and dev in bdmap:
+                        log.debug("EBS volume already mapped to %s by AMI" % dev)
+                        log.debug("Removing %s from runtime block device map" %
                               dev)
-                    bdmap.pop(dev)
+                        bdmap.pop(dev)
             block_device_map = bdmap
         if price:
             return self.request_spot_instances(
@@ -455,61 +467,6 @@ class EasyEC2(EasyAWS):
             availability_zone_group=availability_zone_group,
             placement=placement, placement_group=placement_group,
             user_data=user_data, block_device_map=block_device_map)
-
-    def _wait_for_propagation(self, obj_ids, fetch_func, id_filter, obj_name,
-                              max_retries=5, interval=5):
-        """
-        Wait for a list of object ids to appear in the AWS API. Requires a
-        function that fetches the objects and also takes a filters kwarg. The
-        id_filter specifies the id filter to use for the objects and
-        obj_name describes the objects for log messages.
-        """
-        filters = {id_filter: obj_ids}
-        num_objs = len(obj_ids)
-        num_reqs = 0
-        reqs_ids = []
-        max_retries = max(1, max_retries)
-        interval = max(1, interval)
-        s = utils.get_spinner("Waiting for %s to propagate..." % obj_name)
-        try:
-            for i in range(max_retries):
-                reqs = fetch_func(filters=filters)
-                reqs_ids = [req.id for req in reqs]
-                num_reqs = len(reqs)
-                if num_reqs != num_objs:
-                    log.debug("%d: only %d/%d %s have "
-                              "propagated - sleeping..." %
-                              (i, num_reqs, num_objs, obj_name))
-                    time.sleep(interval)
-                else:
-                    return
-        finally:
-            s.stop()
-        log.warn("Only %d/%d %s propagated..." %
-                 (num_reqs, num_objs, obj_name))
-        missing = [oid for oid in obj_ids if oid not in reqs_ids]
-        log.warn("Missing %s: %s" % (obj_name, ', '.join(missing)))
-
-    def wait_for_propagation(self, instances=None, spot_requests=None,
-                             max_retries=5, interval=5):
-        """
-        Wait for newly created instances and/or spot_requests to register in
-        the AWS API by repeatedly calling get_all_{instances, spot_requests}.
-        Calling this method directly after creating new instances or spot
-        requests before operating on them helps to avoid eventual consistency
-        errors about instances or spot requests not existing.
-        """
-        if spot_requests:
-            spot_ids = [getattr(s, 'id', s) for s in spot_requests]
-            self._wait_for_propagation(
-                spot_ids, self.get_all_spot_requests,
-                'spot-instance-request-id', 'spot requests',
-                max_retries=max_retries, interval=interval)
-        if instances:
-            instance_ids = [getattr(i, 'id', i) for i in instances]
-            self._wait_for_propagation(
-                instance_ids, self.get_all_instances, 'instance-id',
-                'instances', max_retries=max_retries, interval=interval)
 
     def run_instances(self, image_id, instance_type='m1.small', min_count=1,
                       max_count=1, key_name=None, security_groups=None,
@@ -576,7 +533,13 @@ class EasyEC2(EasyAWS):
 
     def get_keypair(self, keypair):
         try:
-            return self.get_keypairs(filters={'key-name': keypair})[0]
+            keypairs=self.get_keypairs(filters={'key-name': keypair})
+            res=keypairs[0]
+            for k in keypairs:
+                if k.name==keypair:
+                    res=k
+                    break
+            return res
         except boto.exception.EC2ResponseError, e:
             if e.error_code == "InvalidKeyPair.NotFound":
                 raise exception.KeyPairDoesNotExist(keypair)
@@ -612,8 +575,69 @@ class EasyEC2(EasyAWS):
     def get_all_instances(self, instance_ids=[], filters=None):
         reservations = self.conn.get_all_instances(instance_ids,
                                                    filters=filters)
+      
+        sub_reservations = []
+        if not filters:
+            sub_reservations =  reservations
+
+        _instances=[]
+        _results=[]
+        rev_map={}
+        for r in reservations:
+            _instances.extend(r.instances)
+            for i in r.instances:
+                rev_map[i]=r
+
+        for ins in _instances:
+            hit=True
+            if filters:
+                for f in filters:
+                    try:
+                        if f=='instance-id':
+                            value = ins.id
+                        elif f=='instance.group-name':
+                            if self.not_aws():
+                                value=rev_map[ins].groups[0].id
+                            else:
+                                value=rev_map[ins].groups[0].name
+                        elif f=='instance-state-name':
+                            continue
+                        else:
+                            value=filters[f]
+                        if value!=filters[f]:
+                            hit=False
+                            continue
+                    except:
+                        pass
+            if hit:
+                ins.groups=rev_map[ins].groups
+                _results.append(ins)
+        return _results
+
+
+    def get_all_instances_backup(self, instance_ids=[], filters=None):
+        reservations = self.conn.get_all_instances(instance_ids,
+                                                   filters=filters)
+        sub_reservations = []
+        f = filters
+        if f and len(f)>0:
+            sub_reservations = []
+            for r in reservations:
+                if len(r.instances) == 0:
+                    continue
+                group_name=None
+                if f.has_key('instance.group-name'):
+                    group_name =f['instance.group-name']
+                state_names=None
+                if f.has_key('instance-state-name'):
+                    state_names = f['instance-state-name']
+                if (state_names and r.instances[0].state in state_names or not state_names):
+                    if (group_name and r.groups[0].id==group_name):
+                        sub_reservations.append(r)
+        else:
+            sub_reservations = reservations
         instances = []
-        for res in reservations:
+        for res in sub_reservations:
             insts = res.instances
             for i in insts:
                 # set group info
@@ -647,7 +671,16 @@ class EasyEC2(EasyAWS):
                                                          filters=filters)
         return spots
 
+
+    def not_aws(self):
+        """
+        check if running on AWS ec2, for handling API compatibility
+        """
+        return self.region.endpoint.find('ec2')==-1
+
     def list_all_spot_instances(self, show_closed=False):
+        if self.not_aws():
+            return 
         s = self.conn.get_all_spot_instance_requests()
         if not s:
             log.info("No spot instance requests found...")
@@ -690,7 +723,7 @@ class EasyEC2(EasyAWS):
 
     def show_instance(self, instance):
         instance_id = instance.id or 'N/A'
-        groups = ', '.join([g.name for g in instance.groups])
+        groups = ', '.join([g.name for g in instance.groups if g.name])
         dns_name = instance.dns_name or 'N/A'
         private_dns_name = instance.private_dns_name or 'N/A'
         state = instance.state or 'N/A'
@@ -709,7 +742,7 @@ class EasyEC2(EasyAWS):
         print "id: %s" % instance_id
         print "dns_name: %s" % dns_name
         print "private_dns_name: %s" % private_dns_name
-        if instance.reason:
+        if hasattr(instance,'reason') and instance.reason:
             print "state: %s (%s)" % (state, instance.reason)
         else:
             print "state: %s" % state
@@ -828,7 +861,10 @@ class EasyEC2(EasyAWS):
             if split[-1].startswith('rc'):
                 rc = int(split[-1].replace('rc', ''))
             return (osversion, rc)
-        self.list_images(imgs, sort_key=sc_public_sort, reverse=True)
+        if self.not_aws():
+            self.list_images(imgs, reverse=True)
+        else:
+            self.list_images(imgs, sort_key=sc_public_sort, reverse=True)
 
     def create_volume(self, size, zone, snapshot_id=None):
         msg = "Creating %sGB volume in zone %s" % (size, zone)
@@ -933,7 +969,18 @@ class EasyEC2(EasyAWS):
         return icreator.create_image(size=root_vol_size)
 
     def get_images(self, filters=None):
-        return self.conn.get_all_images(filters=filters)
+        #return self.conn.get_all_images(filters=filters)
+
+        images =  self.conn.get_all_images(filters=filters)
+        if filters == None or len(filters)==0:
+            return images
+        results=[]
+        for f in filters:
+            for g in images:
+                if f == 'image-id' and filters[f].find( g.id)>=0 :
+                    results.append(g)
+        return results
+
 
     def get_image(self, image_id):
         """

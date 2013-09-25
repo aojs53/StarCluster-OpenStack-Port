@@ -153,8 +153,15 @@ class Node(object):
             self._alias = alias
         return self._alias
 
+    @alias.setter
+    def alias(self,val):
+        self._alias = val
+
+
     def get_plugins(self):
         plugstxt = self.user_data.get(static.UD_PLUGINS_FNAME)
+        if not plugstxt:
+            return []
         payload = plugstxt.split('\n', 2)[2]
         plugins_metadata = utils.decode_uncompress_load(payload)
         plugs = []
@@ -182,6 +189,8 @@ class Node(object):
 
     def get_volumes(self):
         volstxt = self.user_data.get(static.UD_VOLUMES_FNAME)
+        if not volstxt:
+           return []
         payload = volstxt.split('\n', 2)[2]
         return utils.decode_uncompress_load(payload)
 
@@ -551,10 +560,10 @@ class Node(object):
         """
         user = self.getpwnam(username)
         known_hosts_file = posixpath.join(user.pw_dir, '.ssh', 'known_hosts')
+        self.remove_from_known_hosts(username, nodes)
         khosts = []
         if add_self and self not in nodes:
             nodes.append(self)
-        self.remove_from_known_hosts(username, nodes)
         for node in nodes:
             server_pkey = node.ssh.get_server_public_key()
             node_names = {}.fromkeys([node.alias, node.private_dns_name,
@@ -685,13 +694,26 @@ class Node(object):
         self.ssh.remove_lines_from_file('/etc/exports', regex)
         self.ssh.execute('exportfs -fra')
 
-    def start_nfs_server(self):
+    def start_nfs_server_v2(self):
         log.info("Starting NFS server on %s" % self.alias)
         self.ssh.execute('/etc/init.d/portmap start')
         self.ssh.execute('mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs/',
                          ignore_exit_status=True)
         self.ssh.execute('/etc/init.d/nfs start')
         self.ssh.execute('/usr/sbin/exportfs -fra')
+
+
+    def start_nfs_server(self):
+        log.info("Starting NFS server on %s" % self.alias)
+        self.ssh.execute(' yum install nfs* -y; service rpcbind start;\
+            service nfs start;chkconfig rpcbind on; chkconfig nfs on;service iptables stop')
+        self.ssh.execute('mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs/',
+                         ignore_exit_status=True)
+    #    self.ssh.execute('/etc/init.d/portmap start')
+    #    self.ssh.execute('mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs/',
+    #                     ignore_exit_status=True)
+    #    self.ssh.execute('/etc/init.d/nfs start')
+
 
     def mount_nfs_shares(self, server_node, remote_paths):
         """
@@ -700,7 +722,11 @@ class Node(object):
         server_node - remote server node that is sharing the remote_paths
         remote_paths - list of remote paths to mount from server_node
         """
-        self.ssh.execute('/etc/init.d/portmap start')
+        self.ssh.execute(' yum install nfs* -y; service rpcbind start;\
+            service nfs start;chkconfig rpcbind on; chkconfig nfs on; service iptables stop')
+
+
+        #self.ssh.execute('/etc/init.d/portmap start')
         # TODO: move this fix for xterm somewhere else
         self.ssh.execute('mount -t devpts none /dev/pts',
                          ignore_exit_status=True)
@@ -833,7 +859,8 @@ class Node(object):
         the case of EBS backed instances
         """
         attached_vols = {}
-        attached_vols.update(self.block_device_mapping)
+        if self.block_device_mapping:
+            attached_vols.update(self.block_device_mapping)
         if self.is_ebs_backed():
             # exclude the root device from the list
             root_dev = self.root_device_name
@@ -1004,7 +1031,8 @@ class Node(object):
     @property
     def ssh(self):
         if not self._ssh:
-            self._ssh = sshutils.SSHClient(self.instance.dns_name,
+            #self._ssh = sshutils.SSHClient(self.instance.dns_name,
+            self._ssh = sshutils.SSHClient(self.instance.ip_address,
                                            username=self.user,
                                            private_key=self.key_location)
         return self._ssh
@@ -1039,7 +1067,7 @@ class Node(object):
             if forward_agent:
                 sshopts += ' -A'
             ssh_cmd = static.SSH_TEMPLATE % dict(opts=sshopts, user=user,
-                                                 host=self.dns_name)
+                                                 host=self.ip_address)
             if command:
                 command = "'source /etc/profile && %s'" % command
                 ssh_cmd = ' '.join([ssh_cmd, command])

@@ -1,8 +1,18 @@
-=================
-StarCluster v0.94
-=================
+==================
+Starcluster OpenStack
+==================
+New features
+==========
+* Openstack support
+* Centos support
+* Slurm support
+* Only need empty image
+
+===================
+StarCluster v0.9999
+===================
 :StarCluster: Cluster Computing Toolkit for the Cloud
-:Version: 0.94
+:Version: 0.9999
 :Author: Justin Riley <justin.t.riley@gmail.com>
 :Team: Software Tools for Academics and Researchers (http://star.mit.edu)
 :Homepage: http://star.mit.edu/cluster
@@ -47,13 +57,17 @@ Interested? See the `getting started`_ section for more details.
 
 Getting Started:
 ================
-Install StarCluster using easy_install::
+Install StarCluster using `easy_install`::
 
-    $ sudo easy_install StarCluster
+    $ easy_install StarCluster
 
-or to install StarCluster manually::
+or using `pip`::
 
-    $ (Download StarCluster from http://star.mit.edu/cluster)
+    $ pip install StarCluster
+
+or manually::
+
+    $ (Download StarCluster from http://star.mit.edu/cluster/downloads.html)
     $ tar xvzf starcluster-X.X.X.tar.gz  (where x.x.x is a version number)
     $ cd starcluster-X.X.X
     $ sudo python setup.py install
@@ -175,6 +189,17 @@ Watch an ~8 minute screencast @ http://star.mit.edu/cluster
 
 To learn more have a look at the documentation:
 http://star.mit.edu/cluster/docs/latest
+
+Community
+=========
+StarCluster has a mailing list for users and developers:
+
+http://star.mit.edu/cluster/mailinglist.html
+
+Join our IRC channel #starcluster on freenode. If you do not have an IRC client
+you can join the #starcluster channel using your web browser:
+
+http://webchat.freenode.net/?channels=starcluster
 
 Licensing
 =========

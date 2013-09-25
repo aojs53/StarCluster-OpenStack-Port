@@ -24,6 +24,8 @@ import warnings
 
 import iptools
 
+import boto
+
 from starcluster import utils
 from starcluster import static
 from starcluster import sshutils
@@ -49,6 +51,12 @@ class ClusterManager(managers.Manager):
     def __repr__(self):
         return "<ClusterManager: %s>" % self.ec2.region.name
 
+    def not_aws(self):
+        """
+        check if running on AWS ec2, for handling API compatibility
+        """
+        return self.ec2.region.endpoint.find('ec2')==-1
+
     def get_cluster(self, cluster_name, group=None, load_receipt=True,
                     load_plugins=True, load_volumes=True, require_keys=True):
         """
@@ -61,6 +69,7 @@ class ClusterManager(managers.Manager):
                 group = self.ec2.get_security_group(clname)
             cl = Cluster(ec2_conn=self.ec2, cluster_tag=cltag,
                          cluster_group=group)
+#                         cluster_group=group,num_threads=1,disable_threads=True)
             if load_receipt:
                 cl.load_receipt(load_plugins=load_plugins,
                                 load_volumes=load_volumes)
@@ -156,7 +165,7 @@ class ClusterManager(managers.Manager):
 
     def _get_cluster_name(self, cluster_name):
         """
-        Returns human readable cluster name/tag prefixed with '@sc-'
+        Returns human readable cluster name/tag prefixed with '_sc-'
         """
         if not cluster_name.startswith(static.SECURITY_GROUP_PREFIX):
             cluster_name = static.SECURITY_GROUP_TEMPLATE % cluster_name
@@ -219,7 +228,7 @@ class ClusterManager(managers.Manager):
 
     def get_cluster_security_group(self, group_name):
         """
-        Return cluster security group by appending '@sc-' to group_name and
+        Return cluster security group by appending '_sc-' to group_name and
         querying EC2.
         """
         gname = self._get_cluster_name(group_name)
@@ -233,11 +242,19 @@ class ClusterManager(managers.Manager):
 
     def get_cluster_security_groups(self):
         """
-        Return all security groups on EC2 that start with '@sc-'
+        Return all security groups on EC2 that start with '_sc-'
         """
         glob = static.SECURITY_GROUP_TEMPLATE % '*'
         sgs = self.ec2.get_security_groups(filters={'group-name': glob})
-        return sgs
+
+        res = []
+        if self.not_aws():
+            for sg in sgs:
+                if self.get_tag_from_sg(sg.name):
+                    res.append(sg)
+            return res
+        else:
+            return sgs
 
     def get_tag_from_sg(self, sg):
         """
@@ -245,7 +262,7 @@ class ClusterManager(managers.Manager):
         with static.SECURITY_GROUP_PREFIX
 
         Example:
-            sg = '@sc-mycluster'
+            sg = '_sc-mycluster'
             print get_tag_from_sg(sg)
             mycluster
         """
@@ -255,7 +272,8 @@ class ClusterManager(managers.Manager):
         if match:
             tag = match.groups()[0]
         if not tag:
-            raise ValueError("Invalid cluster group name: %s" % sg)
+            #raise ValueError("Invalid cluster group name: %s" % sg)
+            return None
         return tag
 
     def list_clusters(self, cluster_groups=None, show_ssh_status=False):
@@ -336,7 +354,7 @@ class ClusterManager(managers.Manager):
                 print 'Cluster nodes:'
                 for node in nodes:
                     nodeline = "    %7s %s %s %s" % (node.alias, node.state,
-                                                     node.id, node.dns_name)
+                                                     node.id, node.ip_address)
                     if node.spot_id:
                         nodeline += ' (spot %s)' % node.spot_id
                     if show_ssh_status:
@@ -385,7 +403,8 @@ class Cluster(object):
                  permissions=[],
                  userdata_scripts=[],
                  refresh_interval=30,
-                 disable_queue=False,
+                 #disable_queue=False,
+                 disable_queue=True,
                  num_threads=20,
                  disable_threads=False,
                  cluster_group=None,
@@ -429,6 +448,7 @@ class Cluster(object):
         self._zone = None
         self._master = None
         self._nodes = []
+        self._instances = []
         self._pool = None
         self._progress_bar = None
         self.__default_plugin = None
@@ -564,13 +584,14 @@ class Cluster(object):
         """
         try:
             tags = self.cluster_group.tags
-            version = tags.get(static.VERSION_TAG, '')
-            if utils.program_version_greater(version, static.VERSION):
-                d = dict(cluster=self.cluster_tag, old_version=static.VERSION,
-                         new_version=version)
-                msg = user_msgs.version_mismatch % d
-                sep = '*' * 60
-                log.warn('\n'.join([sep, msg, sep]), extra={'__textwrap__': 1})
+            if tags and tags.has_key(static.VERSION_TAG):
+                version = tags.get(static.VERSION_TAG, '')
+                if utils.program_version_greater(version, static.VERSION):
+                    d = dict(cluster=self.cluster_tag, old_version=static.VERSION,
+                             new_version=version)
+                    msg = user_msgs.version_mismatch % d
+                    sep = '*' * 60
+                    log.warn('\n'.join([sep, msg, sep]), extra={'__textwrap__': 1})
             cluster_settings = {}
             if static.CORE_TAG in tags:
                 core = tags.get(static.CORE_TAG, '')
@@ -590,6 +611,7 @@ class Cluster(object):
                                      sr.instance_id]
                 if unfulfilled_spots:
                     self.wait_for_active_spots()
+                    self.wait_for_active_instances()
                     master = self.master_node
                 else:
                     raise
@@ -635,26 +657,27 @@ class Cluster(object):
                 sg = self.ec2.create_group(self._security_group,
                                            description=desc, auth_ssh=True,
                                            auth_group_traffic=True)
-                if not static.VERSION_TAG in sg.tags:
-                    sg.add_tag(static.VERSION_TAG, str(static.VERSION))
-                core_settings = utils.dump_compress_encode(
-                    dict(cluster_size=self.cluster_size,
-                         master_image_id=self.master_image_id,
-                         master_instance_type=self.master_instance_type,
-                         node_image_id=self.node_image_id,
-                         node_instance_type=self.node_instance_type,
-                         disable_queue=self.disable_queue,
-                         disable_cloudinit=self.disable_cloudinit),
-                    use_json=True)
-                if not static.CORE_TAG in sg.tags:
-                    sg.add_tag('@sc-core', core_settings)
-                user_settings = utils.dump_compress_encode(
-                    dict(cluster_user=self.cluster_user,
-                         cluster_shell=self.cluster_shell,
-                         keyname=self.keyname,
-                         spot_bid=self.spot_bid), use_json=True)
-                if not static.USER_TAG in sg.tags:
-                    sg.add_tag('@sc-user', user_settings)
+                if not self.not_aws():
+                    if not static.VERSION_TAG in sg.tags:
+                        sg.add_tag(static.VERSION_TAG, str(static.VERSION))
+                    core_settings = utils.dump_compress_encode(
+                        dict(cluster_size=self.cluster_size,
+                             master_image_id=self.master_image_id,
+                             master_instance_type=self.master_instance_type,
+                             node_image_id=self.node_image_id,
+                             node_instance_type=self.node_instance_type,
+                             disable_queue=self.disable_queue,
+                             disable_cloudinit=self.disable_cloudinit),
+                        use_json=True)
+                    if not static.CORE_TAG in sg.tags:
+                        sg.add_tag('_sc-core', core_settings)
+                    user_settings = utils.dump_compress_encode(
+                        dict(cluster_user=self.cluster_user,
+                             cluster_shell=self.cluster_shell,
+                             keyname=self.keyname,
+                             spot_bid=self.spot_bid), use_json=True)
+                    if not static.USER_TAG in sg.tags:
+                        sg.add_tag('_sc-user', user_settings)
             ssh_port = static.DEFAULT_SSH_PORT
             for p in self.permissions:
                 perm = self.permissions.get(p)
@@ -686,7 +709,8 @@ class Cluster(object):
     def master_node(self):
         if not self._master:
             for node in self.nodes:
-                if node.is_master():
+                #if node.is_master():
+                if self.is_master(node.id)[0]:
                     self._master = node
             if not self._master:
                 raise exception.MasterDoesNotExist()
@@ -699,6 +723,18 @@ class Cluster(object):
         filters = {'instance-state-name': states,
                    'instance.group-name': self._security_group}
         nodes = self.ec2.get_all_instances(filters=filters)
+        self._instances = nodes
+        
+        #set master
+        if self.not_aws():
+           for n in nodes:
+               (master,seq)= self.is_master( n.id )
+               if master:
+                   n.alias="master"
+    #               self._master = n
+               else:
+                   n.alias="node%d" %(seq)
+
         # remove any cached nodes not in the current node list from EC2
         current_ids = [n.id for n in nodes]
         remove_nodes = [n for n in self._nodes if n.id not in current_ids]
@@ -715,8 +751,12 @@ class Cluster(object):
                 enode.instance = node
             else:
                 log.debug('adding node %s to self._nodes list' % node.id)
-                n = Node(node, self.key_location)
-                if n.is_master():
+                if self.not_aws():
+                    n = Node(node, self.key_location,node.alias)
+                else:
+                    n = Node(node, self.key_location)
+                #if n.is_master():
+                if self.is_master(n.id)[0]:
                     self._master = n
                     self._nodes.insert(0, n)
                 else:
@@ -764,6 +804,8 @@ class Cluster(object):
 
     @property
     def spot_requests(self):
+        if self.not_aws():
+            return []
         filters = {'launch.group-id': self.cluster_group.id,
                    'state': ['active', 'open']}
         return self.ec2.get_all_spot_requests(filters=filters)
@@ -793,12 +835,33 @@ class Cluster(object):
         udfiles = [alias_file, plugins_file, volumes_file]
         user_scripts = self.userdata_scripts or []
         udfiles += [open(f) for f in user_scripts]
+
+        use_cloudinit = not self.disable_cloudinit
+        use_cloudinit = False
+        udata = userdata.bundle_userdata_files(udfiles,
+                                               use_cloudinit=use_cloudinit)
+        import strutils
+        udata = strutils.safe_encode(udata)
+        log.debug('Userdata size in KB: %.2f' % utils.size_in_kb(udata))
+        return udata
+
+    def _get_cluster_userdata_2(self, aliases):
+        alias_file = utils.string_to_file('\n'.join(['#ignored'] + aliases),
+                                          static.UD_ALIASES_FNAME)
+        plugins = utils.dump_compress_encode(self._plugins)
+        plugins_file = utils.string_to_file('\n'.join(['#ignored', plugins]),
+                                            static.UD_PLUGINS_FNAME)
+        volumes = utils.dump_compress_encode(self.volumes)
+        volumes_file = utils.string_to_file('\n'.join(['#ignored', volumes]),
+                                            static.UD_VOLUMES_FNAME)
+        udfiles = [alias_file, plugins_file, volumes_file]
+        user_scripts = self.userdata_scripts or []
+        udfiles += [open(f) for f in user_scripts]
         use_cloudinit = not self.disable_cloudinit
         udata = userdata.bundle_userdata_files(udfiles,
                                                use_cloudinit=use_cloudinit)
         log.debug('Userdata size in KB: %.2f' % utils.size_in_kb(udata))
         return udata
-
     def create_nodes(self, aliases, image_id=None, instance_type=None,
                      zone=None, placement_group=None, spot_bid=None,
                      force_flat=False):
@@ -898,14 +961,10 @@ class Cluster(object):
                     raise exception.ClusterValidationError(
                         "node with alias %s already exists" % node.alias)
             log.info("Launching node(s): %s" % ', '.join(aliases))
-            resp = self.create_nodes(aliases, image_id=image_id,
-                                     instance_type=instance_type, zone=zone,
-                                     placement_group=placement_group,
-                                     spot_bid=spot_bid)
-            if spot_bid:
-                self.ec2.wait_for_propagation(spot_requests=resp)
-            else:
-                self.ec2.wait_for_propagation(instances=resp[0].instances)
+            self.create_nodes(aliases, image_id=image_id,
+                              instance_type=instance_type, zone=zone,
+                              placement_group=placement_group,
+                              spot_bid=spot_bid)
         self.wait_for_cluster(msg="Waiting for node(s) to come up...")
         log.debug("Adding node(s): %s" % aliases)
         for alias in aliases:
@@ -923,7 +982,8 @@ class Cluster(object):
         Remove a list of nodes from this cluster
         """
         for node in nodes:
-            if node.is_master():
+            #if node.is_master():
+            if self.is_master(node.id)[0]:
                 raise exception.InvalidOperation("cannot remove master node")
             self.run_plugins(method_name="on_remove_node",
                              node=node, reverse=True)
@@ -1014,6 +1074,40 @@ class Cluster(object):
         else:
             self._create_flat_rate_cluster()
 
+    @property
+    def instances(self):
+        """
+        This code helps to identify the master node if tags is not allowed
+        This happens with openstack. In this case, the instance with the
+        lowest instance id will be treated as the master node. 
+        """
+        return self._instances
+
+    def is_master(self,arg):
+        """
+        Assume the arguments are either instance itself, or an ID
+        """
+        if isinstance(arg, boto.ec2.instance.Instance):
+           instance_id = arg.id
+        else:
+           instance_id = arg
+        if not self.instances or len(self.instances)==0:
+            raise Exception("No instances available, no master defined.")
+        else:
+            #import operator
+            #sorted = sort(self.instances, key=operator.attrgetter('id'))
+            #self._instances.sort(key=lambda n: n.id)
+            if instance_id==self._instances[0].id:
+                return (True,0)
+            else:
+                i=0
+                for ins in self._instances:
+                    if ins.id == instance_id:
+                        return (False,i)
+                    i=i+1
+                raise Exception ("invalid argument input")
+            
+
     def _create_flat_rate_cluster(self):
         """
         Launches cluster using flat-rate instances. This method attempts to
@@ -1026,7 +1120,6 @@ class Cluster(object):
         lmap = self._get_launch_map()
         zone = None
         master_map = None
-        insts = []
         for (type, image) in lmap:
             # launch all aliases that match master's itype/image_id
             aliases = lmap.get((type, image))
@@ -1038,8 +1131,11 @@ class Cluster(object):
                 master_response = self.create_nodes(aliases, image_id=image,
                                                     instance_type=type,
                                                     force_flat=True)[0]
+                for ins in master_response.instances:
+                    self._instances.append(ins)
+                self._instances.sort(key=lambda n: n.id)
+
                 zone = master_response.instances[0].placement
-                insts.extend(master_response.instances)
         lmap.pop(master_map)
         if self.cluster_size <= 1:
             return
@@ -1048,12 +1144,8 @@ class Cluster(object):
             for alias in aliases:
                 log.debug("Launching %s (ami: %s, type: %s)" %
                           (alias, image, type))
-            resv = self.create_nodes(aliases, image_id=image,
-                                     instance_type=type, zone=zone,
-                                     force_flat=True)
-            insts.extend(resv[0].instances)
-        if insts:
-            self.ec2.wait_for_propagation(instances=insts)
+            self.create_nodes(aliases, image_id=image, instance_type=type,
+                              zone=zone, force_flat=True)
 
     def _create_spot_cluster(self):
         """
@@ -1070,17 +1162,14 @@ class Cluster(object):
                                            image_id=mimage,
                                            instance_type=mtype,
                                            force_flat=force_flat)
-        insts, spot_reqs = [], []
         zone = None
         if not force_flat and self.spot_bid:
             # Make sure nodes are in same zone as master
             launch_spec = master_response.launch_specification
             zone = launch_spec.placement
-            spot_reqs.append(master_response)
         else:
             # Make sure nodes are in same zone as master
             zone = master_response.instances[0].placement
-            insts.extend(master_response.instances)
         if self.cluster_size <= 1:
             return
         for id in range(1, self.cluster_size):
@@ -1088,10 +1177,8 @@ class Cluster(object):
             (ntype, nimage) = self._get_type_and_image_id(alias)
             log.info("Launching %s (ami: %s, type: %s)" %
                      (alias, nimage, ntype))
-            spot_req = self.create_node(alias, image_id=nimage,
-                                        instance_type=ntype, zone=zone)
-            spot_reqs.append(spot_req)
-        self.ec2.wait_for_propagation(instances=insts, spot_requests=spot_reqs)
+            self.create_node(alias, image_id=nimage, instance_type=ntype,
+                             zone=zone)
 
     def is_spot_cluster(self):
         """
@@ -1243,10 +1330,27 @@ class Cluster(object):
                 if not pbar.finished:
                     time.sleep(self.refresh_interval)
                     spots = self.get_spot_requests_or_raise()
-                else:
-                    self.ec2.wait_for_propagation(
-                        instances=[s.instance_id for s in active_spots])
             pbar.reset()
+
+    def wait_for_active_instances(self, nodes=None):
+        """
+        Wait indefinitely for cluster nodes to show up.
+        """
+        nodes = nodes or self.nodes
+        if len(nodes) == 0:
+            s = utils.get_spinner("Waiting for instances to activate...")
+            try:
+                while len(nodes) == 0:
+                    time.sleep(self.refresh_interval)
+                    nodes = self.nodes
+            finally:
+                s.stop()
+
+    def not_aws(self):
+        """
+        check if running on AWS ec2, for handling API compatibility
+        """
+        return self.ec2.region.endpoint.find('ec2')==-1
 
     def wait_for_running_instances(self, nodes=None):
         """
@@ -1275,6 +1379,14 @@ class Cluster(object):
         self.pool.map(lambda n: n.wait(interval=self.refresh_interval), nodes,
                       jobid_fn=lambda n: n.alias)
 
+    def is_spot_supported(self):
+        """
+        check whether spot is supported
+        """
+        
+        return not self.not_aws()
+
+
     @print_timing("Waiting for cluster to come up")
     def wait_for_cluster(self, msg="Waiting for cluster to come up..."):
         """
@@ -1287,12 +1399,41 @@ class Cluster(object):
         interval = self.refresh_interval
         log.info("%s %s" % (msg, "(updating every %ds)" % interval))
         try:
-            self.wait_for_active_spots()
+            if self.is_spot_supported():
+                self.wait_for_active_spots()
             self.wait_for_running_instances()
+            self.allocate_ips() 
             self.wait_for_ssh()
         except Exception:
             self.progress_bar.finish()
             raise
+
+    def get_free_ips(self,co):
+        return [a for a in co.get_all_addresses() if a.instance_id.find('None')>=0]
+
+    def allocate_ips(self):
+        """
+        This is for some wield deployment when the IP address is not automatically
+        allocated by the cloud.
+        The code will iterate the free IPs and try to get associate to the instances.
+   
+        Note the melbourne nectar cloud seems doesn't set the ip_address value, but
+        it allocate ip upfroun, so allocate_ip is not needed.
+        """
+        ips = self.get_free_ips(self.ec2.conn)
+        if len(ips)==0:
+            return
+
+        #TODO() add more redundancy
+        i = 0 
+        for ins in self.instances:
+            import re
+            pattern="(^127\.0\.0\.1)|(^10\.)|(^172\.1[6-9]\.)|(^172\.2[0-9]\.)|(^172\.3[0-1]\.)|(^192\.168\.)"
+            if (not ins.ip_address or re.match(pattern,ins.ip_address)) and i<len(ips):
+                self.ec2.conn.associate_address(ins.id,ips[i].public_ip)
+                i=i+1
+
+                
 
     def is_cluster_stopped(self):
         """
@@ -1418,6 +1559,7 @@ class Cluster(object):
         nodes = self.nodes
         for node in nodes:
             node.terminate()
+       
         for spot in self.spot_requests:
             if spot.state not in ['cancelled', 'closed']:
                 log.info("Canceling spot instance request: %s" % spot.id)
@@ -1768,6 +1910,9 @@ class ClusterValidator(validators.Validator):
         if not image:
             raise exception.ClusterValidationError('Image %s does not exist' %
                                                    image_id)
+        if image.architecture == None or image.architecture== "" or image.virtualization_type == None:
+            return True
+
         image_platform = image.architecture
         image_is_hvm = (image.virtualization_type == "hvm")
         if image_is_hvm and instance_type not in static.HVM_TYPES:
@@ -1802,6 +1947,7 @@ class ClusterValidator(validators.Validator):
         return True
 
     def validate_instance_types(self):
+
         cluster = self.cluster
         master_image_id = cluster.master_image_id
         node_image_id = cluster.node_image_id
@@ -2016,6 +2162,13 @@ class ClusterValidator(validators.Validator):
                 "Please check that the file is readable" % (key_location, e))
         if len(fingerprint) == 59:
             keyfingerprint = sshutils.get_private_rsa_fingerprint(key_location)
+            if keyfingerprint != fingerprint:
+                raise exception.ClusterValidationError(
+                    "Incorrect fingerprint for key_location '%s'\n\n"
+                    "local fingerprint: %s\n\nkeypair fingerprint: %s"
+                    % (key_location, keyfingerprint, fingerprint))
+        elif len(fingerprint) == 47:
+            keyfingerprint = sshutils.get_public_rsa_fingerprint(key_location)
             if keyfingerprint != fingerprint:
                 raise exception.ClusterValidationError(
                     "Incorrect fingerprint for key_location '%s'\n\n"

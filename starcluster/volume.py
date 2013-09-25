@@ -34,8 +34,8 @@ class VolumeCreator(cluster.Cluster):
 
     host_instance - EC2 instance to use when formatting volume. must exist in
     the same zone as the new volume. if not specified this class will look for
-    host instances in the @sc-volumecreator security group.  If it can't find
-    an instance in the @sc-volumecreator group that matches the zone of the
+    host instances in the _sc-volumecreator security group.  If it can't find
+    an instance in the _sc-volumecreator group that matches the zone of the
     new volume, a new instance is launched.
 
     shutdown_instance - True will shutdown the host instance after volume
@@ -70,7 +70,7 @@ class VolumeCreator(cluster.Cluster):
 
     def _get_existing_instance(self, zone):
         """
-        Returns any existing instance in the @sc-volumecreator group that's
+        Returns any existing instance in the _sc-volumecreator group that's
         located in zone.
         """
         active_states = ['pending', 'running']
