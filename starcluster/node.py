@@ -92,6 +92,9 @@ class Node(object):
         self._memory = None
         self._user_data = None
 
+    def not_aws(self):
+        return self.ec2.region.endpoint.find('ec2')==-1
+
     def __repr__(self):
         return '<Node: %s (%s)>' % (self.alias, self.id)
 
@@ -155,6 +158,8 @@ class Node(object):
 
     @alias.setter
     def alias(self,val):
+        import pdb
+        pdb.set_trace()
         self._alias = val
 
 
@@ -212,7 +217,10 @@ class Node(object):
     @property
     def groups(self):
         if not self._groups:
-            groups = map(lambda x: x.name, self.instance.groups)
+            if self.not_aws():
+                groups = map(lambda x: x.id, self.instance.groups)
+            else:
+                groups = map(lambda x: x.name, self.instance.groups)
             self._groups = self.ec2.get_all_security_groups(groupnames=groups)
         return self._groups
 
@@ -305,7 +313,11 @@ class Node(object):
 
     @property
     def key_name(self):
-        return self.instance.key_name
+        # fix the redhat keyname bug
+        if not self.instance.key_name:
+            return self.instance.key_name
+        else:
+            return self.instance.key_name.split()[0]
 
     @property
     def arch(self):
@@ -694,7 +706,10 @@ class Node(object):
         self.ssh.remove_lines_from_file('/etc/exports', regex)
         self.ssh.execute('exportfs -fra')
 
-    def start_nfs_server_v2(self):
+    def start_nfs_server_ubuntu(self):
+        """
+        ubuntu way of start nfs_server
+        """
         log.info("Starting NFS server on %s" % self.alias)
         self.ssh.execute('/etc/init.d/portmap start')
         self.ssh.execute('mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs/',
@@ -702,18 +717,21 @@ class Node(object):
         self.ssh.execute('/etc/init.d/nfs start')
         self.ssh.execute('/usr/sbin/exportfs -fra')
 
-
     def start_nfs_server(self):
+        if self.package_install == "yum":
+            self.start_nfs_server_centos()
+        else:
+            self.start_nfs_server_ubuntu()
+     
+    def start_nfs_server_centos(self):
+        """
+        centos way of starting nfs server
+        """
         log.info("Starting NFS server on %s" % self.alias)
         self.ssh.execute(' yum install nfs* -y; service rpcbind start;\
             service nfs start;chkconfig rpcbind on; chkconfig nfs on;service iptables stop')
         self.ssh.execute('mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs/',
                          ignore_exit_status=True)
-    #    self.ssh.execute('/etc/init.d/portmap start')
-    #    self.ssh.execute('mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs/',
-    #                     ignore_exit_status=True)
-    #    self.ssh.execute('/etc/init.d/nfs start')
-
 
     def mount_nfs_shares(self, server_node, remote_paths):
         """
@@ -722,11 +740,13 @@ class Node(object):
         server_node - remote server node that is sharing the remote_paths
         remote_paths - list of remote paths to mount from server_node
         """
-        self.ssh.execute(' yum install nfs* -y; service rpcbind start;\
-            service nfs start;chkconfig rpcbind on; chkconfig nfs on; service iptables stop')
+        
+        if self.package_install == "yum":
+            self.ssh.execute(' yum install nfs* -y; service rpcbind start;\
+                service nfs start;chkconfig rpcbind on; chkconfig nfs on; service iptables stop')
+        else:
+            self.ssh.execute('/etc/init.d/portmap start')
 
-
-        #self.ssh.execute('/etc/init.d/portmap start')
         # TODO: move this fix for xterm somewhere else
         self.ssh.execute('mount -t devpts none /dev/pts',
                          ignore_exit_status=True)
