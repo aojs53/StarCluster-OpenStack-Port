@@ -718,7 +718,9 @@ class Node(object):
         self.ssh.execute('/usr/sbin/exportfs -fra')
 
     def start_nfs_server(self):
-        if self.package_install == "yum":
+        import pdb
+        pdb.set_trace()
+        if self.package_provider == "yum":
             self.start_nfs_server_centos()
         else:
             self.start_nfs_server_ubuntu()
@@ -741,7 +743,7 @@ class Node(object):
         remote_paths - list of remote paths to mount from server_node
         """
         
-        if self.package_install == "yum":
+        if self.package_provider == "yum":
             self.ssh.execute(' yum install nfs* -y; service rpcbind start;\
                 service nfs start;chkconfig rpcbind on; chkconfig nfs on; service iptables stop')
         else:
