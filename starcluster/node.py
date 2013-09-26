@@ -158,8 +158,6 @@ class Node(object):
 
     @alias.setter
     def alias(self,val):
-        import pdb
-        pdb.set_trace()
         self._alias = val
 
 
@@ -718,8 +716,6 @@ class Node(object):
         self.ssh.execute('/usr/sbin/exportfs -fra')
 
     def start_nfs_server(self):
-        import pdb
-        pdb.set_trace()
         if self.package_provider == "yum":
             self.start_nfs_server_centos()
         else:
